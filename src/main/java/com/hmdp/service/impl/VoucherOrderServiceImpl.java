@@ -1,5 +1,6 @@
 package com.hmdp.service.impl;
 
+import cn.hutool.json.JSONUtil;
 import com.hmdp.dto.Result;
 import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.VoucherOrder;
@@ -11,6 +12,8 @@ import com.hmdp.utils.RedisIdWorker;
 import com.hmdp.utils.UserHolder;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.aop.framework.AopContext;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -25,6 +28,8 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+
+import static com.hmdp.config.RabbitMQConfig.EXCHANGE_NAME;
 
 /**
  * <p>
@@ -47,6 +52,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private ISeckillVoucherService seckillVoucherService;
     @Resource//获取全局唯一订单id
     private RedisIdWorker redisIdWorker;
+    @Resource
+    private RabbitTemplate rabbitTemplate;
 
     // 创建调用Lua脚本所需对象，因为给每个线程都创建io流很浪费资源和性能，所以这里使用静态属性的方式
     public static final DefaultRedisScript<Long> SECKILL_SCRIPT;
@@ -60,10 +67,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     }
 
     //阻塞队列
-    private BlockingQueue<VoucherOrder>orderTasks=new ArrayBlockingQueue<>(1024*1024);
+//    private BlockingQueue<VoucherOrder>orderTasks=new ArrayBlockingQueue<>(1024*1024);
 
     //线程池
-    private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
+//    private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
 
     //代理
     private IVoucherOrderService proxy;
@@ -118,35 +125,36 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     //使用Lua代码实现秒杀
 
-    @PostConstruct  // Spring注解，在该类加载完成以后，马上执行该方法，因为读取阻塞队列的线程应该在秒杀之前就就绪了
-    private void init(){
-        // 提交线程任务，异步读取阻塞队列并写入数据库
-        SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
-    }
-
-
-    // 内部类，线程要执行的读取阻塞队列任务
-    private  class VoucherOrderHandler implements Runnable{
-        @Override
-        public void run() {
-            while (true) {
-                try {
-                    // 因为BlockingQueue.take()是专门用于读取阻塞队列的方法
-                    // 所以阻塞队列为空时会自动阻塞，所以不用担心while循环给CPU带来压力
-                    // 1.获取并删除队列中的头部(最上面一条)订单信息
-                    VoucherOrder voucherOrder = orderTasks.take();
-                    // 2.创建订单
-                    handleVoucherOrder(voucherOrder);
-                } catch (Exception e) {
-                    log.error("处理订单异常",e);
-                }
-            }
-        }
-    }
+//    @PostConstruct  // Spring注解，在该类加载完成以后，马上执行该方法，因为读取阻塞队列的线程应该在秒杀之前就就绪了
+//    private void init(){
+//        // 提交线程任务，异步读取阻塞队列并写入数据库
+//        SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
+//    }
+//
+//
+//
+//    // 内部类，线程要执行的读取阻塞队列任务
+//    private  class VoucherOrderHandler implements Runnable{
+//        @Override
+//        public void run() {
+//            while (true) {
+//                try {
+//                    // 因为BlockingQueue.take()是专门用于读取阻塞队列的方法
+//                    // 所以阻塞队列为空时会自动阻塞，所以不用担心while循环给CPU带来压力
+//                    // 1.获取并删除队列中的头部(最上面一条)订单信息
+//                    VoucherOrder voucherOrder = orderTasks.take();
+//                    // 2.创建订单
+//                    handleVoucherOrder(voucherOrder);
+//                } catch (Exception e) {
+//                    log.error("处理订单异常",e);
+//                }
+//            }
+//        }
+//    }
 
     // 异步线程执行写入数据库的任务之前要判断以及获取锁、释放锁，还有通过主线程的代理类(为了让事务生效)，调用执行写入数据库的方法
 // 其实我觉得下面的锁在单线程要求下，其实没有意义，而且在主线程的Lua脚本中以及进行了判断，能下单的肯定都是有购买资格且库存充足的，并不惧怕并发引发问题，但是为了保险起见还是要写一下，同时万一以后要用到多个异步线程来处理呢
-    private void handleVoucherOrder(VoucherOrder voucherOrder) {
+    public void handleVoucherOrder(VoucherOrder voucherOrder) {
         // 1.获取用户id
         // 这里把 UserHolder.getUser().getId()换成了voucherOrder.getUserId(),
         // 是因为这一步操作是有异步线程来完成的，他独立于主线程的，所以他的Threadlocal中不会有User对象
@@ -198,9 +206,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
         //创建代理
         proxy=(IVoucherOrderService)AopContext.currentProxy();
-        //放入阻塞队列
-        orderTasks.add(voucherOrder);
+        //放入消息队列
 
+        String voucherOrderStr = JSONUtil.toJsonStr(voucherOrder);
+        rabbitTemplate.convertAndSend(EXCHANGE_NAME,"boot.order",voucherOrderStr);
+
+//        orderTasks.add(voucherOrder);
         return Result.ok(orderId);
     }
 
